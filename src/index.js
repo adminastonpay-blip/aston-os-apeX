@@ -24,10 +24,12 @@ export default {
   async fetch(request, env, ctx) {
     const requestId = crypto.randomUUID();
     if (request.method === "OPTIONS") return preflight(request, env);
-    try { return await route(request, env, ctx, requestId); }
-    catch (e) {
+    try {
+      const response = await route(request, env, ctx, requestId);
+      return withTelemetryHeaders(response, request, requestId);
+    } catch (e) {
       console.error("[ASTON_OMNI_CRITICAL_EXCEPTION]", { requestId, error: safeMessage(e) });
-      return json({ ok: false, error: "Omni-Core Engine Exception", request_id: requestId }, 500, request, env);
+      return withTelemetryHeaders(json({ ok: false, error: "Omni-Core Engine Exception", request_id: requestId }, 500, request, env), request, requestId);
     }
   },
   async scheduled(controller, env, ctx) {
@@ -94,7 +96,9 @@ async function handleNeuralChat(req, env, ctx, rid) {
   if (!message) return json({ ok: false, error: "Field 'message' is required" }, 400, req, env);
   if (message.length > 8000) return json({ ok: false, error: "Message too long" }, 413, req, env);
   const sid = typeof parsed.data.session_id === "string" && /^[a-zA-Z0-9_-]{8,64}$/.test(parsed.data.session_id) ? parsed.data.session_id : crypto.randomUUID();
-  const history = await getHistory(env, sid);
+  const sessionTenant = (req.headers.get("X-Aston-Tenant") || "global-default").slice(0, 100);
+  const sessionKey = sessionStorageKey(sessionTenant, sid);
+  const history = await getHistory(env, sessionKey);
   const messages = [
     { role: "system", content: "You are ASTON OS Omni-Core, a global intelligence engine operating on the Edge. Provide precise analytics across sectors: Agritech, Energy, Fintech, GovTech, Health, Mobility and Media." },
     ...history, { role: "user", content: message }
@@ -109,11 +113,35 @@ async function handleNeuralChat(req, env, ctx, rid) {
     } catch (e) { console.warn(`[OMNI_AI_FALLBACK] ${model} failed: ${safeMessage(e)}`); }
   }
   if (!answer) return json({ ok: false, error: "All neural models failed", request_id: rid }, 502, req, env);
-  ctx.waitUntil(saveHistory(env, sid, message, answer).catch((e) => console.error("[HISTORY_FAIL]", safeMessage(e))));
+  ctx.waitUntil(saveHistory(env, sessionKey, message, answer).catch((e) => console.error("[HISTORY_FAIL]", safeMessage(e))));
   return json({ ok: true, request_id: rid, session_id: sid, answer, model: modelUsed }, 200, req, env);
 }
 
-const SELECT_SQL = "SELECT id, tenant_id, sector, title, payload, created_at FROM enterprise_records WHERE tenant_id = ? AND sector = ? ORDER BY created_at DESC LIMIT 100";
+const INSERT_SQL = "INSERT INTO enterprise_records (id, tenant_id, sector, title, payload) VALUES (?, ?, ?, ?, ?)";
+async function handleSectorRecords(req, env, ctx, rid, sector) {
+  const tenant = (req.headers.get("X-Aston-Tenant") || "global-default").slice(0, 100);
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 50, 1, 100);
+    const offset = parseBoundedInt(url.searchParams.get("offset"), 0, 0, 1000000);
+    if (!Number.isInteger(limit) || !Number.isInteger(offset)) {
+      return json({ ok: false, error: "limit must be 1-100 and offset must be 0-1000000", request_id: rid }, 400, req, env);
+    }
+    const sort = url.searchParams.get("sort") || "created_at";
+    const direction = (url.searchParams.get("direction") || "desc").toLowerCase();
+    const sortColumn = ({ created_at: "created_at", title: "title" })[sort];
+    if (!sortColumn || !["asc", "desc"].includes(direction)) {
+      return json({ ok: false, error: "Invalid sort or direction", request_id: rid }, 400, req, env);
+    }
+    const title = (url.searchParams.get("title") || "").trim().slice(0, 200);
+    const from = url.searchParams.get("from");
+    const to = url.searchParams.get("to");
+    if ((from && !Number.isFinite(Date.parse(from))) || (to && !Number.isFinite(Date.parse(to)))) {
+      return json({ ok: false, error: "Invalid from/to date; use an ISO-8601 date", request_id: rid }, 400, req, env);
+    }
+    const where = ["tenant_id = ?", "sector = ?"];
+    const params = [tenant, sector];
+    if (title) { where.push("title LIKE ?"); params.push("%" + title.replace(/[\\%_]/g, "\\const SELECT_SQL = "SELECT id, tenant_id, sector, title, payload, created_at FROM enterprise_records WHERE tenant_id = ? AND sector = ? ORDER BY created_at DESC LIMIT 100";
 const INSERT_SQL = "INSERT INTO enterprise_records (id, tenant_id, sector, title, payload) VALUES (?, ?, ?, ?, ?)";
 async function handleSectorRecords(req, env, ctx, rid, sector) {
   const tenant = (req.headers.get("X-Aston-Tenant") || "global-default").slice(0, 100);
@@ -125,6 +153,20 @@ async function handleSectorRecords(req, env, ctx, rid, sector) {
       catch (e) { console.warn("[RECORDS_READ_FAIL]", safeMessage(e)); }
     }
     return json({ ok: true, request_id: rid, sector, data: results }, 200, req, env);
+  }") + "%"); }
+    if (from) { where.push("created_at >= ?"); params.push(new Date(from).toISOString()); }
+    if (to) { where.push("created_at <= ?"); params.push(new Date(to).toISOString()); }
+    const sql = "SELECT id, tenant_id, sector, title, payload, created_at FROM enterprise_records WHERE " +
+      where.join(" AND ") + " ORDER BY " + sortColumn + " " + direction.toUpperCase() + " LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+    let results = null, readFrom = null;
+    for (const [name, db] of [["primary", env.ASTON_DB], ["backup", env.ASTON_DB_BACKUP]]) {
+      if (!db || results !== null) continue;
+      try { const r = await db.prepare(sql).bind(...params).all(); results = r.results || []; readFrom = name; }
+      catch (e) { console.warn("[RECORDS_READ_FAIL]", { database: name, error: safeMessage(e) }); }
+    }
+    if (results === null) return json({ ok: false, error: "Records storage unavailable", request_id: rid }, 503, req, env);
+    return json({ ok: true, request_id: rid, sector, data: results, page: { limit, offset, returned: results.length, next_offset: results.length === limit ? offset + limit : null }, read_from: readFrom }, 200, req, env);
   }
   if (req.method === "POST") {
     const parsed = await readBody(req);
@@ -228,10 +270,30 @@ function methodNotAllowed(req, env, methods) {
 }
 function headersFor(req, env) {
   const h = new Headers();
-  h.set("Access-Control-Allow-Origin", env?.ASTON_ALLOWED_ORIGIN || "*");
+  const origin = req.headers.get("Origin");
+  const allowlist = String(env?.ASTON_ALLOWED_ORIGIN || "").split(",").map((v) => v.trim()).filter(Boolean);
+  if (origin && allowlist.includes(origin)) h.set("Access-Control-Allow-Origin", origin);
   h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  h.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Aston-Tenant");
+  h.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Aston-Tenant, Idempotency-Key");
   h.set("Vary", "Origin"); h.set("Cache-Control", "no-store"); h.set("X-Content-Type-Options", "nosniff");
+  h.set("Referrer-Policy", "no-referrer");
   return h;
+}
+function withTelemetryHeaders(response, req, requestId) {
+  const headers = new Headers(response.headers);
+  headers.set("X-Request-Id", requestId);
+  const colo = req.cf?.colo;
+  if (typeof colo === "string" && /^[A-Z0-9]{3,5}$/.test(colo)) headers.set("X-Edge-Colo", colo);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+function parseBoundedInt(raw, fallback, min, max) {
+  if (raw === null || raw === "") return fallback;
+  if (!/^-?\\d+$/.test(raw)) return NaN;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : NaN;
+}
+function sessionStorageKey(tenant, sid) {
+  const normalized = String(tenant).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 100);
+  return "session:" + normalized + ":" + sid;
 }
 function safeMessage(e) { return typeof e?.message === "string" ? e.message.slice(0, 250) : "Unknown Error"; }
