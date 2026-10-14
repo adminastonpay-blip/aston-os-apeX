@@ -1,0 +1,42 @@
+name: Validate ASTON Omni-Core Worker
+
+on:
+  pull_request:
+    branches: [main, upload/aston-omni-core-v7-0-1]
+  push:
+    branches: [audit/omni-core-cloudflare-compat]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: JavaScript syntax check
+        run: node --check src/index.js
+
+      - name: Wrangler configuration dry-run (no deploy)
+        run: npx wrangler deploy --dry-run --outdir .wrangler-dry-run
+
+      - name: Upload no artifacts
+        if: always()
+        run: echo "Validation workflow never deploys to Cloudflare."
