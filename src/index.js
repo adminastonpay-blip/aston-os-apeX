@@ -63,12 +63,39 @@ async function route(req, env, ctx, rid) {
     const raw = p.split("/")[3] || "general";
     return handleSectorRecords(req, env, ctx, rid, C.SECTORS.includes(raw) ? raw : "general");
   }
+  if (p === "/v1/stats") {
+    if (req.method !== "GET") return methodNotAllowed(req, env, ["GET"]);
+    if (!authorized(req, env)) return unauthorized(req, env);
+    return handleTenantStats(req, env, rid);
+  }
   if (p === "/v1/ledger") {
     if (req.method !== "POST") return methodNotAllowed(req, env, ["POST"]);
     if (!authorized(req, env)) return unauthorized(req, env);
     return handleLedgerTransaction(req, env, ctx, rid);
   }
   return json({ ok: false, error: "Omni protocol endpoint not found", request_id: rid }, 404, req, env);
+}
+
+async function handleTenantStats(req, env, rid) {
+  const tenant = (req.headers.get("X-Aston-Tenant") || "global-default").slice(0, 100);
+  const db = env.ASTON_DB || env.ASTON_DB_BACKUP;
+  if (!db) return json({ ok: false, error: "Records storage unavailable", request_id: rid }, 503, req, env);
+  try {
+    const total = await db.prepare("SELECT COUNT(*) AS count FROM enterprise_records WHERE tenant_id = ?").bind(tenant).first();
+    const bySector = await db.prepare("SELECT sector, COUNT(*) AS count FROM enterprise_records WHERE tenant_id = ? GROUP BY sector ORDER BY sector").bind(tenant).all();
+    const recent = await db.prepare("SELECT COUNT(*) AS count FROM enterprise_records WHERE tenant_id = ? AND created_at >= datetime('now', '-24 hours')").bind(tenant).first();
+    return json({
+      ok: true,
+      request_id: rid,
+      tenant,
+      generated_at: new Date().toISOString(),
+      records: { total: Number(total?.count || 0), last_24_hours: Number(recent?.count || 0), by_sector: bySector?.results || [] },
+      dependencies: { d1: "available", kv: env.ASTON_KV ? "binding_present" : "not_configured", r2: env.ASTON_R2 ? "binding_present" : "not_configured", queue: env.EVENTS ? "binding_present" : "not_configured", ai: env.AI ? "binding_present" : "not_configured" }
+    }, 200, req, env);
+  } catch (e) {
+    console.error("[STATS_QUERY_FAIL]", { request_id: rid, error: safeMessage(e) });
+    return json({ ok: false, error: "Stats query failed", request_id: rid }, 503, req, env);
+  }
 }
 
 async function handleUniversalIngest(req, env, ctx, rid, sector) {
